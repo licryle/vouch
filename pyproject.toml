@@ -103,7 +103,7 @@ packages = ["src/vouch"]
 # force-include hard-errors when webapp/dist isn't built (fresh checkout, sdist
 # → wheel), whereas the hook skips it and `vouch console` reports it cleanly.
 [tool.hatch.build.targets.wheel.hooks.custom]
-path = "hatch_build.py"
+path = "src/vouch/hatch_build.py"
 
 [tool.ruff]
 line-length = 100

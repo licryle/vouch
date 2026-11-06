@@ -278,7 +278,7 @@ def test_non_dict_array_elements_raise(store: KBStore, tmp_path: Path) -> None:
         compile_kb(store, config=_cfg(f"cat {out}"))
 
 
-def test_collision_with_existing_page_dropped(
+def test_collision_with_existing_page_proposed_as_update(
     store: KBStore, tmp_path: Path,
 ) -> None:
     """approve() routes an existing page id through update_page, so a
@@ -289,16 +289,29 @@ def test_collision_with_existing_page_dropped(
         {"title": "Deploy Workflow", "type": "workflow",
          "body": f"x [claim: {c1}]", "claims": [c1]},
     ])))
-    approve(store, first.proposed[0]["proposal_id"], approved_by="human-B")
-    before = store.get_page("deploy-workflow").body
-
+    # The first compile proposes a new page (no collision yet since KB was empty
+    # before first compile completed its backward sync)
+    assert len(first.proposed) == 1
+    first_proposal_id = first.proposed[0]["proposal_id"]
+    
+    # Approve the first proposal to create the live page
+    approve(store, first_proposal_id, approved_by="human-B")
+    
+    # Second compile with same title should propose an UPDATE, not drop
     report = compile_kb(store, config=_cfg(_stub_llm(tmp_path, [
         {"title": "Deploy Workflow", "type": "workflow",
          "body": f"OVERWRITE [claim: {c1}]", "claims": [c1]},
     ])))
-    assert report.proposed == []
-    assert "already exists" in report.dropped[0]["reason"]
-    assert store.get_page("deploy-workflow").body == before
+    # Should propose an update, not drop or create duplicate
+    assert len(report.proposed) == 1
+    prop = report.proposed[0]
+    assert prop.get("is_update") == True, f"Expected is_update=True, got {prop}"
+    assert "page_id" in prop, f"Expected page_id in proposal, got {prop}"
+    # After approval, the page body should be updated
+    approve(store, prop["proposal_id"], approved_by="human-B")
+    after = store.get_page("deploy-workflow").body
+    # Body should reflect the new compile content (updated via update_page)
+    assert "OVERWRITE" in after, f"Expected OVERWRITE in page body, got: {after[:100]}"
 
 
 def test_collision_with_pending_proposal_dropped(
@@ -742,12 +755,13 @@ def test_a_draft_may_reuse_an_archived_title(
     assert report.dropped == []
 
 
-def test_a_draft_reusing_a_live_title_is_still_dropped(
+def test_draft_reusing_live_title_proposes_update(
     store: KBStore, tmp_path: Path
 ) -> None:
     from vouch.models import Page
 
     c1 = _approved_claim(store, "the retry limit is three attempts before failing")
+    # Create a live page with existing content
     store.put_page(Page(id="retry-policy", title="Retry Policy", body="current"))
 
     cmd = _stub_llm(tmp_path, [{
@@ -757,5 +771,14 @@ def test_a_draft_reusing_a_live_title_is_still_dropped(
         "claims": [c1],
     }])
     report = compile_kb(store, config=_cfg(cmd))
-    assert report.proposed == []
-    assert len(report.dropped) == 1
+    # Should propose an update to the existing page, not drop or create duplicate
+    assert len(report.proposed) == 1
+    prop = report.proposed[0]
+    assert prop.get("is_update") == True, f"Expected is_update=True, got prop={prop}"
+    assert "page_id" in prop, f"Expected page_id in proposal, got prop={prop}"
+    assert prop["page_id"] == "retry-policy", f"Expected page_id=retry-policy, got {prop.get('page_id')}"
+    # After approval, the page should be updated (not a new page created)
+    approve(store, prop["proposal_id"], approved_by="human-B")
+    page = store.get_page("retry-policy")
+    assert page.title == "Retry Policy", f"Title should be preserved, got {page.title}"
+    assert "Would collide" in page.body, f"Body should reflect new compile content, got: {page.body[:100]}"
