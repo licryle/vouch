@@ -341,8 +341,9 @@ def build_prompt(
     lines += [
         "",
         "RULES",
-        f"- Draft at most {max_pages} genuinely NEW topic pages. Skip topics",
-        "  already taken; page updates are not supported yet.",
+        f"- Draft at most {max_pages} topic pages. If a draft's title/slug collides",
+        " with a live page, compile proposes an update instead of creating a",
+        " duplicate. Approved updates land via `store.update_page()`.",
         "- Prefer durable topics over chronology. Never draft a page about a",
         "  session itself; session records are raw material.",
         "- Give each page a one-line \"summary\" (<= 25 words), 3-6 lowercase",
@@ -670,11 +671,57 @@ def compile_kb(
     # the cap is dropped even if an earlier one falls later, so the outcome
     # doesn't depend on drop order.
     survivors: list[tuple[dict[str, Any], str]] = []
+    # Map live page titles/slugs to their IDs for update detection
+    live_page_by_title: dict[str, str] = {}
+    live_page_by_slug: dict[str, str] = {}
+    for p in existing:
+        live_page_by_title[p.title.strip().lower()] = p.id
+        live_page_by_slug[_slugify(p.title.strip())] = p.id
     for i, draft in enumerate(drafts):
         title = str(draft.get("title") or f"draft {i}").strip()
         if len(survivors) >= cap:
             report.dropped.append({"title": title, "reason": f"over max_pages={cap}"})
             continue
+        slug = _slugify(title)
+        title_lower = title.lower()
+        # Check if this title/slug collides with a live page — propose an
+        # update instead of dropping. This reuses the existing
+        # propose_page(update_existing=True, slug_hint=<id>) infrastructure
+        # from the vault-edit path (#219).
+        update_target = None
+        if title_lower in live_page_by_title:
+            update_target = live_page_by_title[title_lower]
+        elif slug in live_page_by_slug:
+            update_target = live_page_by_slug[slug]
+        if update_target:
+            # Get page frontmatter tags/metadata before proposing update
+            page_tags, page_meta = _page_frontmatter(draft)
+            try:
+                kb_page = store.get_page(update_target)
+                proposal = propose_page(
+                    store,
+                    title=title,
+                    body=str(draft["body"]).strip(),
+                    page_type=str(draft.get("type") or "concept").strip().lower(),
+                    claim_ids=[str(c) for c in draft.get("claims") or []],
+                    proposed_by=actor,
+                    tags=page_tags,
+                    metadata=page_meta or None,
+                    session_id=session_id,
+                    rationale="compiled from approved claims; every inline citation was verified against the store",
+                    slug_hint=update_target,
+                    update_existing=True,
+                )
+                report.proposed.append({
+                    "title": title,
+                    "proposal_id": proposal.id,
+                    "page_id": update_target,
+                    "is_update": True,
+                })
+                continue
+            except ProposalError as e:
+                report.dropped.append({"title": title, "reason": str(e)})
+                continue
         problem = _draft_problem(store, draft, taken_names=taken_names)
         if problem:
             report.dropped.append({"title": title, "reason": problem})
@@ -684,8 +731,8 @@ def compile_kb(
         # a later draft in the same batch cannot collide with a just-accepted
         # one. Without this, two drafts with the same title both pass
         # _draft_problem's collision guard and land as duplicate proposals.
-        taken_names.add(title.lower())
-        taken_names.add(_slugify(title))
+        taken_names.add(title_lower)
+        taken_names.add(slug)
 
     # phase 2: wikilinks resolve against existing pages + the *surviving*
     # batch, to a fixpoint — dropping a draft may dangle a link in another,
